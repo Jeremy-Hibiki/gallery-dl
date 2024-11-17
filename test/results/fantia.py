@@ -64,4 +64,12 @@ __tests__ = (
     "post_id"   : 508363,
 },
 
+{
+    "#url": "https://fantia.jp",
+    "#category": ("", "fantia", "home"),
+    "#class": fantia.FantiaHomeExtractor,
+    "#range": "1-25",
+    "#count": ">= 25",
+},
+
 )

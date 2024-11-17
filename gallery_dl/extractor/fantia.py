@@ -201,3 +201,33 @@ class FantiaPostExtractor(FantiaExtractor):
     def posts(self):
         self._csrf_token()
         return (self.post_id,)
+
+
+class FantiaHomeExtractor(FantiaExtractor):
+    """Extractor for media from home page"""
+    subcategory = "home"
+    pattern = r"(?:https?://)?(?:www\.)?fantia\.jp/?$"
+    example = "https://fantia.jp"
+
+    def _timeline_api_pagination(self, url):
+        params = {
+            "page": 1,
+            "per": 24,
+            "free_plan": "all",
+        }
+        while True:
+            posts = self.request(url, params=params).json()["posts"]
+            self._csrf_token()
+
+            post_id = None
+            for post in posts:
+                post_id = str(post["id"])
+                yield post_id
+
+            if not post_id:
+                return
+            params["page"] += 1
+
+    def posts(self):
+        url = "{}/api/v1/me/timelines/posts".format(self.root)
+        return self._timeline_api_pagination(url)
