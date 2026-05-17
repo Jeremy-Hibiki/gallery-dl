@@ -16,8 +16,7 @@ import hashlib
 import binascii
 import urllib.parse
 
-import requests
-import requests.auth
+import httpx
 
 from . import text
 
@@ -37,36 +36,45 @@ def concat(*args):
     return "&".join(quote(item) for item in args)
 
 
-class OAuth1Session(requests.Session):
-    """Extension to requests.Session to support OAuth 1.0"""
+class OAuth1Session():
+    """Extension to httpx.Client to support OAuth 1.0"""
 
     def __init__(self, consumer_key, consumer_secret,
                  token=None, token_secret=None):
-
-        requests.Session.__init__(self)
         self.auth = OAuth1Client(
             consumer_key, consumer_secret,
             token, token_secret,
         )
+        self._session = httpx.Client()
+        self.cookies = self._session.cookies
 
-    def rebuild_auth(self, prepared_request, response):
-        if "Authorization" in prepared_request.headers:
-            del prepared_request.headers["Authorization"]
-            prepared_request.prepare_auth(self.auth)
+    def request(self, method, url, **kwargs):
+        req = self._session.build_request(method, url, **kwargs)
+        self.auth(req)
+        return self._session.send(req)
+
+    def get(self, url, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+    def close(self):
+        self._session.close()
 
 
-class OAuth1Client(requests.auth.AuthBase):
+class OAuth1Client():
     """OAuth1.0a authentication"""
 
     def __init__(self, consumer_key, consumer_secret,
                  token=None, token_secret=None):
-
         self.consumer_key = consumer_key
         self.consumer_secret = consumer_secret
         self.token = token
         self.token_secret = token_secret
 
     def __call__(self, request):
+        """Sign an httpx Request with OAuth 1.0 headers."""
         oauth_params = [
             ("oauth_consumer_key", self.consumer_key),
             ("oauth_nonce", nonce(16)),
@@ -87,7 +95,8 @@ class OAuth1Client(requests.auth.AuthBase):
 
     def generate_signature(self, request, params):
         """Generate 'oauth_signature' value"""
-        url, _, query = request.url.partition("?")
+        url = str(request.url)
+        url, _, query = url.partition("?")
 
         params = params.copy()
         for key, value in text.parse_query(query).items():

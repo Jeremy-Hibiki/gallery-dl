@@ -18,13 +18,204 @@ import pickle
 import random
 import getpass
 import logging
-import requests
+import httpx
 import threading
+import urllib.parse
 from xml.etree import ElementTree
-from requests.adapters import HTTPAdapter
+from curl_cffi import Session as CurlSession
+from curl_cffi.requests import RequestsError as CurlRequestsError
 from .message import Message
 from .. import config, output, text, util, dt, cache, exception
-urllib3 = requests.packages.urllib3
+
+
+class ResponseWrapper():
+    """Normalizes httpx.Response and curl_cffi.Response APIs."""
+
+    __slots__ = ("_resp", "_stream_ctx", "_iter")
+
+    def __init__(self, response, stream_ctx=None):
+        self._resp = response
+        self._stream_ctx = stream_ctx
+        self._iter = None
+
+    @property
+    def status_code(self):
+        return self._resp.status_code
+
+    @property
+    def reason(self):
+        r = self._resp
+        # httpx uses reason_phrase, curl_cffi uses reason
+        return getattr(r, "reason_phrase", None) or getattr(r, "reason", "") or ""
+
+    @property
+    def text(self):
+        return self._resp.text
+
+    @property
+    def content(self):
+        return self._resp.content
+
+    @property
+    def url(self):
+        return str(self._resp.url)
+
+    @property
+    def headers(self):
+        return self._resp.headers
+
+    @property
+    def encoding(self):
+        return self._resp.encoding
+
+    @encoding.setter
+    def encoding(self, value):
+        self._resp.encoding = value
+
+    @property
+    def history(self):
+        return [ResponseWrapper(r) for r in self._resp.history]
+
+    def json(self):
+        return self._resp.json()
+
+    def iter_content(self, chunk_size=1):
+        if self._iter is not None:
+            return self._iter
+        resp = self._resp
+        if hasattr(resp, "iter_content"):
+            gen = resp.iter_content(chunk_size)
+        else:
+            gen = resp.iter_bytes(chunk_size)
+        self._iter = gen
+        return gen
+
+    @property
+    def raw(self):
+        return _RawProxy(self._resp)
+
+    def close(self):
+        self._resp.close()
+        if self._stream_ctx is not None:
+            try:
+                self._stream_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._stream_ctx = None
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+
+class _CookiesProxy():
+    """Proxy that provides a requests-compatible cookies interface.
+
+    Both httpx.Cookies and curl_cffi Cookies iterate over cookie names
+    (str) instead of Cookie objects. This proxy iterates over the
+    underlying CookieJar to yield real Cookie objects.
+    """
+
+    __slots__ = ("_cookies",)
+
+    def __init__(self, cookies):
+        self._cookies = cookies
+
+    def set(self, name, value, domain="", **kwargs):
+        if "expires" in kwargs or "path" in kwargs:
+            # Create a real Cookie object for advanced params
+            import http.cookiejar
+            expires = kwargs.get("expires")
+            path = kwargs.get("path", "/")
+            cookie = http.cookiejar.Cookie(
+                version=0, name=name, value=value,
+                port=None, port_specified=False,
+                domain=domain, domain_specified=bool(domain),
+                domain_initial_dot=domain.startswith("."),
+                path=path, path_specified=True,
+                secure=kwargs.get("secure", False),
+                expires=expires,
+                discard=expires is None,
+                comment=None, comment_url=None, rest={}, rfc2109=False,
+            )
+            self._cookies.jar.set_cookie(cookie)
+        else:
+            self._cookies.set(name, value, domain=domain)
+
+    def set_cookie(self, cookie):
+        self._cookies.jar.set_cookie(cookie)
+
+    @property
+    def jar(self):
+        return self._cookies.jar
+
+    def __iter__(self):
+        return iter(self._cookies.jar)
+
+    def __len__(self):
+        return len(self._cookies)
+
+    def __contains__(self, key):
+        return key in self._cookies
+
+    def __bool__(self):
+        return bool(self._cookies)
+
+    def keys(self):
+        return self._cookies.keys()
+
+    def values(self):
+        return self._cookies.values()
+
+    def items(self):
+        return self._cookies.items()
+
+    def get(self, name, default=None, domain=None):
+        return self._cookies.get(name, default, domain=domain)
+
+    def clear(self):
+        self._cookies.clear()
+
+    def __repr__(self):
+        return repr(self._cookies)
+
+
+# Patch httpx.Headers to ignore None values and accept bytes (requests compat)
+_orig_headers_setitem = httpx.Headers.__setitem__
+
+
+def _patched_setitem(self, key, value):
+    if value is not None:
+        if isinstance(value, bytes):
+            value = value.decode("latin1")
+        _orig_headers_setitem(self, key, value)
+
+
+httpx.Headers.__setitem__ = _patched_setitem
+
+
+class _RawProxy():
+    """Proxy for response.raw compatibility (chunked detection)."""
+    __slots__ = ("_resp",)
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    @property
+    def chunked(self):
+        te = self._resp.headers.get("transfer-encoding", "")
+        return "chunked" in te.lower()
+
+
+def _format_connection_error(exc):
+    try:
+        if isinstance(exc, CurlRequestsError):
+            return str(exc)
+        reason = exc.args[0].reason
+        cls = reason.__class__.__name__
+        pre, _, err = str(reason.args[-1]).partition(":")
+        return f" {cls}: {(err or pre).lstrip()}"
+    except Exception:
+        return str(exc)
 
 
 class Extractor():
@@ -98,11 +289,11 @@ class Extractor():
 
         if self.session is None:
             self._init_session()
-            self.cookies = self.session.cookies
+            self.cookies = _CookiesProxy(self.session.cookies)
             if self.cookies_domain is not None:
                 self._init_cookies()
         else:
-            self.cookies = self.session.cookies
+            self.cookies = _CookiesProxy(self.session.cookies)
 
         self._init()
         self.initialize = util.noop
@@ -169,6 +360,27 @@ class Extractor():
                 else:
                     kwargs["headers"] = {"Content-Type": "application/json"}
 
+        # Translate kwargs for httpx compatibility
+        if isinstance(session, httpx.Client):
+            if "allow_redirects" in kwargs:
+                kwargs["follow_redirects"] = kwargs.pop("allow_redirects")
+            # httpx handles verify/proxies at Client level, not per-request
+            kwargs.pop("verify", None)
+            kwargs.pop("proxies", None)
+            # httpx replaces URL query params when params kwarg is provided,
+            # but requests merges them. Merge into the URL manually.
+            extra_params = kwargs.get("params")
+            if extra_params and "?" in url:
+                parsed = urllib.parse.urlparse(url)
+                existing = urllib.parse.parse_qs(parsed.query)
+                for k, v in (extra_params.items()
+                             if isinstance(extra_params, dict)
+                             else extra_params):
+                    existing.setdefault(k, []).append(v)
+                query = urllib.parse.urlencode(existing, doseq=True)
+                url = urllib.parse.urlunparse(parsed._replace(query=query))
+                del kwargs["params"]
+
         response = challenge = None
         tries = 1
 
@@ -180,22 +392,18 @@ class Extractor():
 
         while True:
             try:
-                response = session.request(method, url, **kwargs)
-            except requests.exceptions.ConnectionError as exc:
-                try:
-                    reason = exc.args[0].reason
-                    cls = reason.__class__.__name__
-                    pre, _, err = str(reason.args[-1]).partition(":")
-                    msg = f" {cls}: {(err or pre).lstrip()}"
-                except Exception:
-                    msg = exc
+                raw_response = session.request(method, url, **kwargs)
+                response = ResponseWrapper(raw_response)
+            except (httpx.ConnectError, CurlRequestsError) as exc:
+                msg = _format_connection_error(exc)
                 code = 0
-            except (requests.exceptions.Timeout,
-                    requests.exceptions.ChunkedEncodingError,
-                    requests.exceptions.ContentDecodingError) as exc:
+            except (httpx.TimeoutException,) as exc:
                 msg = exc
                 code = 0
-            except (requests.exceptions.RequestException) as exc:
+            except (httpx.StreamError, httpx.DecodingError) as exc:
+                msg = exc
+                code = 0
+            except httpx.HTTPError as exc:
                 msg = exc
                 break
             else:
@@ -510,96 +718,146 @@ class Extractor():
                 self.request_interval_429)
 
     def _init_session(self):
-        self.session = session = requests.Session()
-        headers = session.headers
-        headers.clear()
-        ssl_options = ssl_ciphers = 0
-
-        # .netrc Authorization headers are alwsays disabled
-        session.trust_env = True if self.config("proxy-env", True) else False
-
         browser = self.config("browser")
         if browser is None:
             browser = self.browser
+
         if browser and isinstance(browser, str):
-            browser, _, platform = browser.lower().partition(":")
+            browser_lower, _, platform = browser.lower().partition(":")
 
-            if not platform or platform == "auto":
-                platform = ("Windows NT 10.0; Win64; x64"
-                            if util.WINDOWS else "X11; Linux x86_64")
-            elif platform == "windows":
-                platform = "Windows NT 10.0; Win64; x64"
-            elif platform == "linux":
-                platform = "X11; Linux x86_64"
-            elif platform == "macos":
-                platform = "Macintosh; Intel Mac OS X 15.5"
-
-            if browser == "chrome":
-                if platform.startswith("Macintosh"):
-                    platform = platform.replace(".", "_")
+            if browser_lower.startswith("firefox"):
+                impersonate = "firefox"
+            elif browser_lower.startswith("chrome"):
+                impersonate = "chrome"
             else:
-                browser = "firefox"
+                impersonate = browser_lower
 
-            for key, value in HEADERS[browser]:
-                if value and "{}" in value:
-                    headers[key] = value.replace("{}", platform)
+            self.session = session = CurlSession(
+                impersonate=impersonate)  # type: ignore[arg-type]
+            headers = session.headers
+
+            if referer := self.config("referer", self.referer):
+                if isinstance(referer, str):
+                    headers["Referer"] = referer
+                elif self.root:
+                    headers["Referer"] = self.root + "/"
+
+            custom_ua = self.config("user-agent")
+            if not custom_ua or custom_ua == "auto":
+                pass
+            elif custom_ua == "browser":
+                headers["User-Agent"] = self.cache(
+                    _browser_useragent, None, _exp=86400, _mem=False)
+            elif custom_ua[0] == "@":
+                headers["User-Agent"] = self.cache(
+                    _browser_useragent, custom_ua[1:], _exp=86400, _mem=False)
+            elif custom_ua[0] == "+":
+                custom_ua = custom_ua[1:].lower()
+                if custom_ua in {"firefox", "ff"}:
+                    headers["User-Agent"] = util.USERAGENT_FIREFOX
+                elif custom_ua in {"chrome", "cr"}:
+                    headers["User-Agent"] = util.USERAGENT_CHROME
+                elif custom_ua in {"gallery-dl", "gallerydl", "gdl"}:
+                    headers["User-Agent"] = util.USERAGENT_GALLERYDL
+                elif custom_ua in {"google-bot", "googlebot", "bot"}:
+                    headers["User-Agent"] = "Googlebot-Image/1.0"
                 else:
-                    headers[key] = value
+                    self.log.warning(
+                        "Unsupported User-Agent preset '%s'", custom_ua)
+            elif self.useragent is Extractor.useragent and not self.browser or \
+                    custom_ua is not config.get(("extractor",), "user-agent"):
+                headers["User-Agent"] = custom_ua
 
-            ssl_options |= (ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 |
-                            ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1)
-            ssl_ciphers = CIPHERS[browser]
+            if custom_headers := self.config("headers"):
+                if isinstance(custom_headers, str):
+                    if custom_headers in HEADERS:
+                        custom_headers = HEADERS[custom_headers]
+                    else:
+                        self.log.error("Invalid 'headers' value '%s'",
+                                       custom_headers)
+                        custom_headers = ()
+                headers.update(custom_headers)
+
         else:
+            client_kwargs = {
+                "http2": True,
+                "follow_redirects": True,
+                "verify": self._verify,
+                "trust_env": bool(self.config("proxy-env", True)),
+            }
+            if self._proxies:
+                # httpx uses single proxy= at client level
+                proxy = (self._proxies.get("https") or
+                         self._proxies.get("http"))
+                if proxy and "://" not in proxy:
+                    proxy = "http://" + proxy
+                if proxy:
+                    client_kwargs["proxy"] = proxy
+            self.session = session = httpx.Client(**client_kwargs)
+            headers = session.headers
+            headers.clear()
+
             headers["User-Agent"] = self.useragent
             headers["Accept"] = "*/*"
             headers["Accept-Language"] = "en-US,en;q=0.5"
 
-            ssl_ciphers = self.ciphers
-            if ssl_ciphers is not None and ssl_ciphers in CIPHERS:
-                ssl_ciphers = CIPHERS[ssl_ciphers]
-
-        if BROTLI:
-            headers["Accept-Encoding"] = "gzip, deflate, br"
-        else:
-            headers["Accept-Encoding"] = "gzip, deflate"
-        if ZSTD:
-            headers["Accept-Encoding"] += ", zstd"
-
-        if referer := self.config("referer", self.referer):
-            if isinstance(referer, str):
-                headers["Referer"] = referer
-            elif self.root:
-                headers["Referer"] = self.root + "/"
-
-        custom_ua = self.config("user-agent")
-        if not custom_ua or custom_ua == "auto":
-            pass
-        elif custom_ua == "browser":
-            headers["User-Agent"] = self.cache(
-                _browser_useragent, None, _exp=86400, _mem=False)
-        elif custom_ua[0] == "@":
-            headers["User-Agent"] = self.cache(
-                _browser_useragent, custom_ua[1:], _exp=86400, _mem=False)
-        elif custom_ua[0] == "+":
-            custom_ua = custom_ua[1:].lower()
-            if custom_ua in {"firefox", "ff"}:
-                headers["User-Agent"] = util.USERAGENT_FIREFOX
-            elif custom_ua in {"chrome", "cr"}:
-                headers["User-Agent"] = util.USERAGENT_CHROME
-            elif custom_ua in {"gallery-dl", "gallerydl", "gdl"}:
-                headers["User-Agent"] = util.USERAGENT_GALLERYDL
-            elif custom_ua in {"google-bot", "googlebot", "bot"}:
-                headers["User-Agent"] = "Googlebot-Image/1.0"
+            if BROTLI:
+                headers["Accept-Encoding"] = "gzip, deflate, br"
             else:
-                self.log.warning(
-                    "Unsupported User-Agent preset '%s'", custom_ua)
-        elif self.useragent is Extractor.useragent and not self.browser or \
-                custom_ua is not config.get(("extractor",), "user-agent"):
-            headers["User-Agent"] = custom_ua
+                headers["Accept-Encoding"] = "gzip, deflate"
+            if ZSTD:
+                headers["Accept-Encoding"] += ", zstd"
 
-        custom_xff = self.config("geo-bypass")
-        if custom_xff is None or custom_xff == "auto":
-            custom_xff = self.geobypass
+            if referer := self.config("referer", self.referer):
+                if isinstance(referer, str):
+                    headers["Referer"] = referer
+                elif self.root:
+                    headers["Referer"] = self.root + "/"
+
+            custom_ua = self.config("user-agent")
+            if not custom_ua or custom_ua == "auto":
+                pass
+            elif custom_ua == "browser":
+                headers["User-Agent"] = self.cache(
+                    _browser_useragent, None, _exp=86400, _mem=False)
+            elif custom_ua[0] == "@":
+                headers["User-Agent"] = self.cache(
+                    _browser_useragent, custom_ua[1:], _exp=86400, _mem=False)
+            elif custom_ua[0] == "+":
+                custom_ua = custom_ua[1:].lower()
+                if custom_ua in {"firefox", "ff"}:
+                    headers["User-Agent"] = util.USERAGENT_FIREFOX
+                elif custom_ua in {"chrome", "cr"}:
+                    headers["User-Agent"] = util.USERAGENT_CHROME
+                elif custom_ua in {"gallery-dl", "gallerydl", "gdl"}:
+                    headers["User-Agent"] = util.USERAGENT_GALLERYDL
+                elif custom_ua in {"google-bot", "googlebot", "bot"}:
+                    headers["User-Agent"] = "Googlebot-Image/1.0"
+                else:
+                    self.log.warning(
+                        "Unsupported User-Agent preset '%s'", custom_ua)
+            elif self.useragent is Extractor.useragent and not self.browser or \
+                    custom_ua is not config.get(("extractor",), "user-agent"):
+                headers["User-Agent"] = custom_ua
+
+            if custom_headers := self.config("headers"):
+                if isinstance(custom_headers, str):
+                    if custom_headers in HEADERS:
+                        custom_headers = HEADERS[custom_headers]
+                    else:
+                        self.log.error("Invalid 'headers' value '%s'",
+                                       custom_headers)
+                        custom_headers = ()
+                headers.update(custom_headers)
+
+        if custom_xff := self.config("geo-bypass"):
+            if custom_xff is None or custom_xff == "auto":
+                custom_xff = self.geobypass
+        else:
+            custom_xff = self.config("geo-bypass")
+            if custom_xff == "auto":
+                custom_xff = self.geobypass
+
         if custom_xff is not None:
             if ip := self.utils("/geo").random_ipv4(custom_xff):
                 headers["X-Forwarded-For"] = ip
@@ -607,51 +865,6 @@ class Extractor():
             else:
                 self.log.warning("xff: Invalid ISO 3166 country code '%s'",
                                  custom_xff)
-
-        if custom_headers := self.config("headers"):
-            if isinstance(custom_headers, str):
-                if custom_headers in HEADERS:
-                    custom_headers = HEADERS[custom_headers]
-                else:
-                    self.log.error("Invalid 'headers' value '%s'",
-                                   custom_headers)
-                    custom_headers = ()
-            headers.update(custom_headers)
-
-        if custom_ciphers := self.config("ciphers"):
-            if isinstance(custom_ciphers, list):
-                ssl_ciphers = ":".join(custom_ciphers)
-            elif custom_ciphers in CIPHERS:
-                ssl_ciphers = CIPHERS[custom_ciphers]
-            else:
-                ssl_ciphers = custom_ciphers
-
-        if source_address := self.config("source-address"):
-            if isinstance(source_address, str):
-                source_address = (source_address, 0)
-            else:
-                source_address = (source_address[0], source_address[1])
-
-        tls12 = self.config("tls12")
-        if tls12 is None:
-            tls12 = self.tls12
-        if not tls12:
-            ssl_options |= ssl.OP_NO_TLSv1_2
-            self.log.debug("TLS 1.2 disabled.")
-
-        if self.config("truststore"):
-            try:
-                from truststore import SSLContext as ssl_ctx
-            except ImportError as exc:
-                self.log.error("%s: %s", exc.__class__.__name__, exc)
-                ssl_ctx = None
-        else:
-            ssl_ctx = None
-
-        adapter = _build_requests_adapter(
-            ssl_options, ssl_ciphers, ssl_ctx, source_address)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
 
     def _init_cookies(self):
         """Populate the session's cookiejar"""
@@ -683,9 +896,16 @@ class Extractor():
             else:
                 self.log.debug("cookies: Loading cookies from '%s'",
                                cookies_source)
-                set_cookie = self.cookies.set_cookie
-                for cookie in cookies:
-                    set_cookie(cookie)
+                try:
+                    set_cookie = self.cookies.set_cookie
+                except AttributeError:
+                    for cookie in cookies:
+                        self.cookies.set(
+                            cookie.name, cookie.value,
+                            domain=cookie.domain)
+                else:
+                    for cookie in cookies:
+                        set_cookie(cookie)
                 self.cookies_file = path
 
         elif isinstance(cookies_source, (list, tuple)):
@@ -704,9 +924,16 @@ class Extractor():
             else:
                 self.log.debug("cookies: Using cached cookies from %s", key)
 
-            set_cookie = self.cookies.set_cookie
-            for cookie in cookies:
-                set_cookie(cookie)
+            try:
+                set_cookie = self.cookies.set_cookie
+            except AttributeError:
+                for cookie in cookies:
+                    self.cookies.set(
+                        cookie.name, cookie.value,
+                        domain=cookie.domain)
+            else:
+                for cookie in cookies:
+                    set_cookie(cookie)
 
         else:
             self.log.error(
@@ -730,7 +957,12 @@ class Extractor():
         path_tmp = path + ".tmp"
         try:
             with open(path_tmp, "w", encoding="utf-8") as fp:
-                util.cookiestxt_store(fp, self.cookies)
+                # Use .jar for real Cookie objects (httpx/curl_cffi compat)
+                try:
+                    cookies_iter = self.cookies.jar
+                except AttributeError:
+                    cookies_iter = self.cookies
+                util.cookiestxt_store(fp, cookies_iter)
             os.replace(path_tmp, path)
         except OSError as exc:
             self.log.error("cookies: Failed to write to '%s' "
@@ -741,14 +973,28 @@ class Extractor():
         if isinstance(cookies, dict):
             self.cookies_update_dict(cookies, domain or self.cookies_domain)
         else:
-            set_cookie = self.cookies.set_cookie
             try:
-                cookies = iter(cookies)
-            except TypeError:
-                set_cookie(cookies)
+                set_cookie = self.cookies.set_cookie
+            except AttributeError:
+                try:
+                    cookies = iter(cookies)
+                except TypeError:
+                    self.cookies.set(
+                        cookies.name, cookies.value,
+                        domain=cookies.domain)
+                else:
+                    for cookie in cookies:
+                        self.cookies.set(
+                            cookie.name, cookie.value,
+                            domain=cookie.domain)
             else:
-                for cookie in cookies:
-                    set_cookie(cookie)
+                try:
+                    cookies = iter(cookies)
+                except TypeError:
+                    set_cookie(cookies)
+                else:
+                    for cookie in cookies:
+                        set_cookie(cookie)
 
     def cookies_update_dict(self, cookiedict, domain):
         """Update cookiejar with name-value pairs from a dict"""
@@ -766,7 +1012,14 @@ class Extractor():
         names = set(cookies_names)
         now = time.time()
 
-        for cookie in self.cookies:
+        # Iterate over .jar for real Cookie objects (httpx/curl_cffi
+        # iteration yields strings, not Cookie objects)
+        try:
+            cookie_iter = self.cookies.jar
+        except AttributeError:
+            cookie_iter = self.cookies
+
+        for cookie in cookie_iter:
             if cookie.name not in names:
                 continue
 
@@ -1125,57 +1378,6 @@ class BaseExtractor(Extractor):
                 f"(?:https?://)?(?:{'|'.join(pattern_list)}))")
 
 
-class RequestsAdapter(HTTPAdapter):
-
-    def __init__(self, ssl_context=None, source_address=None):
-        self.ssl_context = ssl_context
-        self.source_address = source_address
-        HTTPAdapter.__init__(self)
-
-    def init_poolmanager(self, *args, **kwargs):
-        kwargs["ssl_context"] = self.ssl_context
-        kwargs["source_address"] = self.source_address
-        return HTTPAdapter.init_poolmanager(self, *args, **kwargs)
-
-    def proxy_manager_for(self, *args, **kwargs):
-        kwargs["ssl_context"] = self.ssl_context
-        kwargs["source_address"] = self.source_address
-        return HTTPAdapter.proxy_manager_for(self, *args, **kwargs)
-
-
-def _build_requests_adapter(
-        ssl_options, ssl_ciphers, ssl_ctx, source_address):
-
-    key = (ssl_options, ssl_ciphers, ssl_ctx, source_address)
-    try:
-        return CACHE_ADAPTERS[key]
-    except KeyError:
-        pass
-
-    if ssl_options or ssl_ciphers or ssl_ctx:
-        if ssl_ctx is None:
-            ssl_context = urllib3.connection.create_urllib3_context(
-                options=ssl_options or None, ciphers=ssl_ciphers)
-            if not requests.__version__ < "2.32":
-                # https://github.com/psf/requests/pull/6731
-                ssl_context.load_verify_locations(requests.certs.where())
-        else:
-            ssl_ctx_orig = urllib3.util.ssl_.SSLContext
-            try:
-                urllib3.util.ssl_.SSLContext = ssl_ctx
-                ssl_context = urllib3.connection.create_urllib3_context(
-                    options=ssl_options or None, ciphers=ssl_ciphers)
-            finally:
-                urllib3.util.ssl_.SSLContext = ssl_ctx_orig
-        ssl_context.check_hostname = False
-    else:
-        ssl_context = None
-
-    adapter = CACHE_ADAPTERS[key] = RequestsAdapter(
-        ssl_context, source_address)
-    return adapter
-
-
 def _browser_useragent(browser):
     """Get User-Agent header from default browser"""
     import webbrowser
@@ -1218,7 +1420,6 @@ def _browser_useragent(browser):
     return useragent.decode()
 
 
-CACHE_ADAPTERS = {}
 CACHE_COOKIES = {}
 CACHE_MEMORY = {}
 CACHE_UTILS = {}
@@ -1302,76 +1503,5 @@ HEADERS = {
     "chrome/111" : HEADERS_CHROMIUM_111,
 }
 
-CIPHERS_FIREFOX = (
-    "TLS_AES_128_GCM_SHA256:"
-    "TLS_CHACHA20_POLY1305_SHA256:"
-    "TLS_AES_256_GCM_SHA384:"
-    "ECDHE-ECDSA-AES128-GCM-SHA256:"
-    "ECDHE-RSA-AES128-GCM-SHA256:"
-    "ECDHE-ECDSA-CHACHA20-POLY1305:"
-    "ECDHE-RSA-CHACHA20-POLY1305:"
-    "ECDHE-ECDSA-AES256-GCM-SHA384:"
-    "ECDHE-RSA-AES256-GCM-SHA384:"
-    "ECDHE-ECDSA-AES256-SHA:"
-    "ECDHE-ECDSA-AES128-SHA:"
-    "ECDHE-RSA-AES128-SHA:"
-    "ECDHE-RSA-AES256-SHA:"
-    "AES128-GCM-SHA256:"
-    "AES256-GCM-SHA384:"
-    "AES128-SHA:"
-    "AES256-SHA"
-)
-CIPHERS_CHROMIUM = (
-    "TLS_AES_128_GCM_SHA256:"
-    "TLS_AES_256_GCM_SHA384:"
-    "TLS_CHACHA20_POLY1305_SHA256:"
-    "ECDHE-ECDSA-AES128-GCM-SHA256:"
-    "ECDHE-RSA-AES128-GCM-SHA256:"
-    "ECDHE-ECDSA-AES256-GCM-SHA384:"
-    "ECDHE-RSA-AES256-GCM-SHA384:"
-    "ECDHE-ECDSA-CHACHA20-POLY1305:"
-    "ECDHE-RSA-CHACHA20-POLY1305:"
-    "ECDHE-RSA-AES128-SHA:"
-    "ECDHE-RSA-AES256-SHA:"
-    "AES128-GCM-SHA256:"
-    "AES256-GCM-SHA384:"
-    "AES128-SHA:"
-    "AES256-SHA"
-)
-CIPHERS = {
-    "firefox"    : CIPHERS_FIREFOX,
-    "firefox/140": CIPHERS_FIREFOX,
-    "firefox/128": CIPHERS_FIREFOX,
-    "chrome"     : CIPHERS_CHROMIUM,
-    "chrome/138" : CIPHERS_CHROMIUM,
-    "chrome/111" : CIPHERS_CHROMIUM,
-}
-
-
-# disable Basic Authorization header injection from .netrc data
-try:
-    requests.sessions.get_netrc_auth = lambda _: None
-except Exception:
-    pass
-
-# detect brotli support
-try:
-    BROTLI = urllib3.response.brotli is not None
-except AttributeError:
-    BROTLI = False
-
-# detect zstandard support
-try:
-    ZSTD = urllib3.response.HAS_ZSTD
-except AttributeError:
-    ZSTD = False
-
-# set (urllib3) warnings filter
-action = config.get((), "warnings", "default")
-if action:
-    try:
-        import warnings
-        warnings.simplefilter(action, urllib3.exceptions.HTTPWarning)
-    except Exception:
-        pass
-del action
+BROTLI = True
+ZSTD = True

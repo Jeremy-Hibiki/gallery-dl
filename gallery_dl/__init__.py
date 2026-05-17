@@ -147,7 +147,8 @@ def main():
             config.set(("downloader",), "progress", None)
         elif args.loglevel <= logging.DEBUG:
             import platform
-            import requests
+            import httpx
+            from curl_cffi import __version__ as curl_cffi_version
 
             if util.EXECUTABLE:
                 extra = f" - Executable ({version.__variant__})"
@@ -160,9 +161,8 @@ def main():
             log.debug("Python %s - %s",
                       platform.python_version(), platform.platform())
             try:
-                log.debug("requests %s - urllib3 %s",
-                          requests.__version__,
-                          requests.packages.urllib3.__version__)
+                log.debug("httpx %s - curl_cffi %s",
+                          httpx.__version__, curl_cffi_version)
             except AttributeError:
                 pass
 
@@ -268,8 +268,9 @@ Entries:
                 return config.open_extern()
 
         if args.print_traffic:
-            import requests
-            requests.packages.urllib3.connection.HTTPConnection.debuglevel = 1
+            import logging as _logging
+            _logging.getLogger("httpx").setLevel(_logging.DEBUG)
+            _logging.getLogger("httpcore").setLevel(_logging.DEBUG)
 
         if args.update:
             from . import update

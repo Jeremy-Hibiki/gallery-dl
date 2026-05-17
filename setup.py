@@ -102,16 +102,18 @@ def build_setuptools():
         maintainer="Mike Fährmann",
         maintainer_email="mike_faehrmann@web.de",
         license="GPL-2.0-only",
-        python_requires=">=3.8",
+        python_requires=">=3.10",
         install_requires=[
-            "requests>=2.11.0",
+            "httpx[http2]>=0.24.0",
+            "curl_cffi>=0.15.0",
+            "brotli",
+            "zstandard",
         ],
         extras_require={
             "video": [
                 "yt-dlp",
             ],
             "extra": [
-                "requests[socks]",
                 "yt-dlp[default]",
                 "jinja2",
                 "pyyaml",

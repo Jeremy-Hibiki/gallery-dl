@@ -10,10 +10,18 @@
 
 import time
 import mimetypes
-from requests.exceptions import RequestException, ConnectionError, Timeout
-from .common import DownloaderBase
-from .. import text, util, output, exception
+import httpx
 from ssl import SSLError
+from curl_cffi.requests import RequestsError as CurlRequestsError
+from .common import DownloaderBase
+from ..extractor.common import ResponseWrapper
+from .. import text, util, output, exception
+
+# Unified exception aliases for retry logic
+_ConnError = (httpx.ConnectError, CurlRequestsError)
+_TimeoutError = (httpx.TimeoutException,)
+_RequestError = (httpx.HTTPError, CurlRequestsError)
+
 FLAGS = util.FLAGS
 
 
@@ -161,25 +169,40 @@ class HttpDownloader(DownloaderBase):
 
             # connect to (remote) source
             try:
-                response = self.session.request(
-                    kwdict.get("_http_method", "GET"), url,
-                    stream=True,
-                    headers=headers,
-                    data=kwdict.get("_http_data"),
-                    timeout=self.timeout,
-                    proxies=self.proxies,
-                    verify=self.verify,
-                )
-            except ConnectionError as exc:
+                method = kwdict.get("_http_method", "GET")
+                request_kwargs = {
+                    "headers": headers,
+                    "data": kwdict.get("_http_data"),
+                    "timeout": self.timeout,
+                }
+
+                if isinstance(self.session, httpx.Client):
+                    # httpx: verify/proxies set at Client level
+                    stream_ctx = self.session.stream(
+                        method, url, **request_kwargs)
+                    raw_response = stream_ctx.__enter__()
+                else:
+                    # curl_cffi: stream=True, pass verify/proxies per-request
+                    request_kwargs["verify"] = self.verify
+                    if self.proxies:
+                        request_kwargs["proxies"] = self.proxies
+                    raw_response = self.session.request(
+                        method, url, stream=True, **request_kwargs)
+                    stream_ctx = None
+                response = ResponseWrapper(raw_response, stream_ctx)
+            except _ConnError as exc:
                 try:
-                    reason = exc.args[0].reason
-                    cls = reason.__class__.__name__
-                    pre, _, err = str(reason.args[-1]).partition(":")
-                    msg = f"{cls}: {(err or pre).lstrip()}"
+                    if isinstance(exc, CurlRequestsError):
+                        msg = str(exc)
+                    else:
+                        reason = exc.args[0].reason
+                        cls = reason.__class__.__name__
+                        pre, _, err = str(reason.args[-1]).partition(":")
+                        msg = f"{cls}: {(err or pre).lstrip()}"
                 except Exception:
                     msg = str(exc)
                 continue
-            except Timeout as exc:
+            except _TimeoutError as exc:
                 msg = str(exc)
                 continue
             except Exception as exc:
@@ -236,6 +259,7 @@ class HttpDownloader(DownloaderBase):
                     self.log.warning("HTTP redirect to '%s'", response.url)
                 else:
                     self.log.warning("HTML response")
+                self.release_conn(response)
                 return False
 
             # check file size
@@ -299,10 +323,8 @@ class HttpDownloader(DownloaderBase):
             # check filename extension against file header
             if not offset and (validate_ext or validate_sig):
                 try:
-                    file_header = next(
-                        content if response.raw.chunked
-                        else response.iter_content(16), b"")
-                except (RequestException, SSLError) as exc:
+                    file_header = next(content, b"")
+                except (*_RequestError, SSLError) as exc:
                     msg = str(exc)
                     continue
                 if validate_sig:
@@ -345,7 +367,7 @@ class HttpDownloader(DownloaderBase):
                 self.out.start(pathfmt.path)
                 try:
                     self.receive(fp, content, size, offset)
-                except (RequestException, SSLError) as exc:
+                except (*_RequestError, SSLError) as exc:
                     msg = str(exc)
                     output.stderr_write("\n")
                     continue
@@ -386,12 +408,12 @@ class HttpDownloader(DownloaderBase):
         try:
             for _ in response.iter_content(self.chunk_size):
                 pass
-        except (RequestException, SSLError) as exc:
+        except (*_RequestError, SSLError) as exc:
             output.stderr_write("\n")
             self.log.debug(
                 "Unable to consume response body (%s: %s); "
                 "closing the connection anyway", exc.__class__.__name__, exc)
-            response.close()
+        response.close()
 
     def receive(self, fp, content, bytes_total, bytes_start):
         write = fp.write

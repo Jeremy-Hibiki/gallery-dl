@@ -301,11 +301,14 @@ Request Headers
 ---------------
 {request_headers}
 """
-        if request.body:
+        body = getattr(request, "body", None) or getattr(request, "content", None)
+        if body:
+            if not isinstance(body, str):
+                body = body.decode("utf-8", errors="replace")
             output = f"""{output}
 Request Body
 ------------
-{request.body}
+{body}
 """
         output = f"""{output}
 Response Headers
@@ -603,6 +606,21 @@ class NullResponse():
 
     def json(self):
         return {}
+
+    def iter_content(self, chunk_size=1):
+        return iter([])
+
+    @property
+    def raw(self):
+        return _NullRaw()
+
+    @property
+    def reason_phrase(self):
+        return self.reason
+
+
+class _NullRaw():
+    chunked = False
 
 
 class CustomNone():
