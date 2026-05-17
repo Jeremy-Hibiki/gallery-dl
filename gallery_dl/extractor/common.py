@@ -372,6 +372,16 @@ class Extractor():
             if headers:
                 kwargs["headers"] = {k: v for k, v in headers.items()
                                      if v is not None}
+            # httpx includes None params as empty; requests silently drops them
+            params = kwargs.get("params")
+            if params:
+                filtered = {k: v for k, v in (params.items()
+                             if isinstance(params, dict) else params)
+                            if v is not None}
+                if isinstance(params, dict):
+                    kwargs["params"] = filtered
+                else:
+                    kwargs["params"] = filtered.items()
             # httpx replaces URL query params when params kwarg is provided,
             # but requests merges them. Merge into the URL manually.
             extra_params = kwargs.get("params")
