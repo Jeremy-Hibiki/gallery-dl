@@ -367,6 +367,11 @@ class Extractor():
             # httpx handles verify/proxies at Client level, not per-request
             kwargs.pop("verify", None)
             kwargs.pop("proxies", None)
+            # httpx rejects None header values; requests silently drops them
+            headers = kwargs.get("headers")
+            if headers:
+                kwargs["headers"] = {k: v for k, v in headers.items()
+                                     if v is not None}
             # httpx replaces URL query params when params kwarg is provided,
             # but requests merges them. Merge into the URL manually.
             extra_params = kwargs.get("params")
