@@ -142,6 +142,10 @@ def main():
 
         # loglevels
         output.configure_logging(args.loglevel)
+        # Suppress httpx/httpcore request logging unless --print-traffic
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("hpack").setLevel(logging.WARNING)
         if args.loglevel >= logging.WARNING:
             config.set(("output",), "mode", "null")
             config.set(("downloader",), "progress", None)
